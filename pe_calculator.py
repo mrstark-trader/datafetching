@@ -1,12 +1,13 @@
-"""Trailing TTM PE Calculator with 3-Year PE Bands
+"""Trailing TTM PE Calculator with 756-Day PE Bands
 ============================================================
-1.  Uses **yfinance** ``get_earnings_dates`` to fetch ~50 quarters of
-    historical quarterly Reported EPS.
+1.  Uses **yfinance** ``earnings_history`` + ``quarterly_income_stmt``
+    for **consolidated** quarterly EPS, falling back to
+    ``get_earnings_dates`` Reported EPS for older quarters.
 2.  Computes **TTM EPS** = sum of most recent 4 quarters' EPS.
 3.  Fetches **daily closing prices** from **Fyers** API.
 4.  **Trailing PE** = Close Price on result date / TTM EPS.
-5.  **PE High / Low / Median (3-year)** computed from daily PE values
-    (daily close / applicable TTM EPS) over the preceding 3 years.
+5.  **PE High / Low / Median** computed from daily PE values
+    (daily close / applicable TTM EPS) over the preceding 756 days.
 
 Single-symbol mode
     python pe_calculator.py --symbol RELIANCE
@@ -76,21 +77,23 @@ OUTPUT_DIR = Path(__file__).parent / "output"
 
 # How many quarters of earnings to fetch from yfinance
 _EARNINGS_LIMIT = 50
-# Years of lookback for PE High/Low/Median bands
-_PE_BAND_YEARS = 3
+# Days of lookback for PE High/Low/Median bands
+_PE_BAND_DAYS = 756
 
 
 # ---------------------------------------------------------------------------
-# Earnings Client  (quarterly Reported EPS via get_earnings_dates)
+# Earnings Client  (consolidated quarterly EPS from Yahoo Finance)
 # ---------------------------------------------------------------------------
 class EarningsClient:
     """
-    Fetches quarterly Reported EPS from Yahoo Finance.
+    Fetches quarterly **consolidated** EPS from Yahoo Finance.
 
-    Uses ``get_earnings_dates`` which provides ~50 quarters of history —
-    far more than ``quarterly_financials`` (~6 quarters).  Each record
-    contains the **earnings announcement date** and the company-reported
-    EPS for that quarter.
+    Uses a hybrid approach (best source wins):
+    1. ``earnings_history``       — consolidated ``epsActual``  (~4 quarters)
+    2. ``quarterly_income_stmt``  — Net Income / sharesOutstanding (~6 quarters)
+    3. ``get_earnings_dates``     — Reported EPS as fallback (may be standalone)
+
+    Announcement dates always come from ``get_earnings_dates``.
     """
 
     def fetch_quarterly_eps(
@@ -98,27 +101,41 @@ class EarningsClient:
     ) -> List[Dict]:
         """
         Returns list of ``{date, eps, estimate}`` sorted **oldest-first**,
-        excluding rows with NaN / missing Reported EPS (future dates).
+        using **consolidated** EPS where available.
         """
-        print(f"[YFinance] Fetching earnings history for {yf_ticker} "
-              f"(limit={limit}) …")
+        print(f"[YFinance] Fetching earnings data for {yf_ticker} …")
         ticker = yf.Ticker(yf_ticker)
-        df = ticker.get_earnings_dates(limit=limit)
 
+        # --- 1. Announcement dates + Reported EPS (fallback) --------------
+        df = ticker.get_earnings_dates(limit=limit)
         if df is None or df.empty:
             print(f"[YFinance] No earnings data for {yf_ticker}")
             return []
 
+        # --- 2. Build consolidated EPS lookup (quarter-end → eps) ----------
+        consolidated = self._build_consolidated_lookup(ticker)
+
+        # --- 3. Merge: prefer consolidated EPS over Reported EPS -----------
         records: List[Dict] = []
+        used_consolidated = 0
         for idx, row in df.iterrows():
-            eps = row.get("Reported EPS")
-            if pd.isna(eps):
+            reported = row.get("Reported EPS")
+            if pd.isna(reported):
                 continue                    # skip future / pending dates
 
             # Convert tz-aware datetime → naive (keep date & time)
             dt = idx.to_pydatetime()
             if dt.tzinfo is not None:
                 dt = dt.replace(tzinfo=None)
+
+            qtr_end = self._announcement_to_quarter_end(dt)
+
+            # Prefer consolidated EPS; fall back to Reported EPS
+            if qtr_end in consolidated:
+                eps = consolidated[qtr_end]
+                used_consolidated += 1
+            else:
+                eps = float(reported)
 
             estimate = row.get("EPS Estimate")
             records.append({
@@ -134,7 +151,79 @@ class EarningsClient:
             print(f"[YFinance] Got {len(records)} quarterly EPS records  "
                   f"({records[0]['date'].strftime('%b %Y')} → "
                   f"{records[-1]['date'].strftime('%b %Y')})")
+            print(f"[YFinance] Consolidated EPS used for "
+                  f"{used_consolidated}/{len(records)} quarters")
         return records
+
+    @staticmethod
+    def _build_consolidated_lookup(ticker) -> Dict[datetime, float]:
+        """
+        Build ``{quarter_end_datetime → consolidated_EPS}`` from
+        ``earnings_history`` and ``quarterly_income_stmt``.
+
+        ``earnings_history`` values take priority over income-stmt
+        computed values because they are company-reported consolidated EPS.
+        """
+        lookup: Dict[datetime, float] = {}
+
+        # Source A: quarterly_income_stmt  Net Income / sharesOutstanding
+        try:
+            qi = ticker.quarterly_income_stmt
+            shares = ticker.info.get("sharesOutstanding")
+            if qi is not None and shares and shares > 0:
+                ni_field = None
+                for f in ["Net Income Common Stockholders", "Net Income"]:
+                    if f in qi.index:
+                        ni_field = f
+                        break
+                if ni_field:
+                    for col in qi.columns:
+                        ni = qi.loc[ni_field, col]
+                        if not pd.isna(ni):
+                            qtr_dt = col.to_pydatetime()
+                            if qtr_dt.tzinfo:
+                                qtr_dt = qtr_dt.replace(tzinfo=None)
+                            lookup[qtr_dt] = round(float(ni) / shares, 2)
+                    print(f"[YFinance] income_stmt: "
+                          f"{len(lookup)} quarters with Net Income")
+        except Exception as exc:
+            print(f"[YFinance] quarterly_income_stmt error: {exc}")
+
+        # Source B: earnings_history (overrides income-stmt values)
+        try:
+            eh = ticker.earnings_history
+            if eh is not None and not eh.empty:
+                count = 0
+                for qtr_idx, row in eh.iterrows():
+                    eps_actual = row.get("epsActual")
+                    if pd.isna(eps_actual):
+                        continue
+                    qtr_dt = (qtr_idx.to_pydatetime()
+                              if hasattr(qtr_idx, "to_pydatetime")
+                              else qtr_idx)
+                    if hasattr(qtr_dt, "tzinfo") and qtr_dt.tzinfo:
+                        qtr_dt = qtr_dt.replace(tzinfo=None)
+                    lookup[qtr_dt] = float(eps_actual)
+                    count += 1
+                print(f"[YFinance] earnings_history: "
+                      f"{count} quarters with consolidated EPS")
+        except Exception as exc:
+            print(f"[YFinance] earnings_history error: {exc}")
+
+        return lookup
+
+    @staticmethod
+    def _announcement_to_quarter_end(dt: datetime) -> datetime:
+        """Map an earnings announcement date to its fiscal quarter-end date."""
+        m, y = dt.month, dt.year
+        if 1 <= m <= 3:            # Jan-Mar → Q ending Dec prev year
+            return datetime(y - 1, 12, 31)
+        elif 4 <= m <= 6:          # Apr-Jun → Q ending Mar
+            return datetime(y, 3, 31)
+        elif 7 <= m <= 9:          # Jul-Sep → Q ending Jun
+            return datetime(y, 6, 30)
+        else:                      # Oct-Dec → Q ending Sep
+            return datetime(y, 9, 30)
 
 
 # ---------------------------------------------------------------------------
@@ -210,11 +299,11 @@ class FyersPriceClient:
 # ---------------------------------------------------------------------------
 class TrailingPECalculator:
     """
-    Orchestrator that computes **Trailing (TTM) PE** with 3-year PE bands.
+    Orchestrator that computes **Trailing (TTM) PE** with 756-day PE bands.
 
     Workflow
     --------
-    1. Fetch ~50 quarters of Reported EPS  (``EarningsClient``).
+    1. Fetch quarterly consolidated EPS  (``EarningsClient``).
     2. Build a **TTM EPS timeline** — at each quarterly earnings date,
        TTM EPS = sum of that quarter + previous 3 quarters.
     3. Fetch daily closing prices from Fyers for the full period.
@@ -222,8 +311,8 @@ class TrailingPECalculator:
        **daily PE = close / TTM EPS**.
     5. For each quarterly result in the report window:
        - **Trailing PE** = close on result date / TTM EPS
-       - **PE High / Low / Median (3 yr)** from daily PE values over the
-         preceding 3 years.
+       - **PE High / Low / Median** from daily PE values over the
+         preceding 756 days.
     """
 
     def __init__(self):
@@ -232,7 +321,7 @@ class TrailingPECalculator:
 
     def compute(self, symbol: str, num_quarters: int = 12) -> List[Dict]:
         """
-        Compute trailing PE with 3-year bands for the last *num_quarters*.
+        Compute trailing PE with 756-day bands for the last *num_quarters*.
 
         Returns list of result dicts (**newest-first**), each with keys:
         ``symbol``, ``earnings_date``, ``quarter_eps``, ``ttm_eps``,
@@ -265,7 +354,7 @@ class TrailingPECalculator:
         #    Go back 3 extra years before the earliest report quarter so
         #    the PE-band computation has enough daily data.
         price_start = (report_window[0]["date"]
-                       - timedelta(days=_PE_BAND_YEARS * 365 + 60))
+                       - timedelta(days=_PE_BAND_DAYS + 60))
         price_end   = datetime.now()
 
         daily_prices = self.fyers_client.fetch_daily_prices(
@@ -403,8 +492,8 @@ class TrailingPECalculator:
         if close_price and ttm_eps and ttm_eps > 0:
             trailing_pe = round(close_price / ttm_eps, 2)
 
-        # 3-year PE bands (from daily PE values)
-        cutoff = earnings_date - timedelta(days=_PE_BAND_YEARS * 365)
+        # 756-day PE bands (from daily PE values)
+        cutoff = earnings_date - timedelta(days=_PE_BAND_DAYS)
         window_pe = [pe for dt, pe in daily_pe
                      if cutoff <= dt <= earnings_date]
 
@@ -444,8 +533,8 @@ class TrailingPECalculator:
         if ttm_eps and ttm_eps > 0:
             trailing_pe = round(last_close / ttm_eps, 2)
 
-        # 3-year PE bands up to today
-        cutoff = last_date - timedelta(days=_PE_BAND_YEARS * 365)
+        # 756-day PE bands up to today
+        cutoff = last_date - timedelta(days=_PE_BAND_DAYS)
         window_pe = [pe for dt, pe in daily_pe if cutoff <= dt <= last_date]
 
         pe_high   = round(max(window_pe), 2) if window_pe else None
@@ -497,7 +586,7 @@ def print_summary_table(results: List[Dict]):
     sym = results[0].get("symbol", "?")
     hdr = (f"  {'Result Date':<26} {'Q EPS':>7} {'TTM EPS':>8} "
            f"{'Price':>10} {'TTM PE':>8}  │ "
-           f"{'Hi(3Y)':>8} {'Lo(3Y)':>8} {'Med(3Y)':>8}")
+           f"{'Hi(756d)':>9} {'Lo(756d)':>9} {'Med(756d)':>10}")
 
     print(f"\n{'=' * 100}")
     print(f"  Trailing PE History — {sym}   "
@@ -552,10 +641,10 @@ def print_summary_table(results: List[Dict]):
         print(f"     Max TTM PE    : {max(pe_vals):.2f}")
         print(f"     Avg TTM PE    : {sum(pe_vals)/len(pe_vals):.2f}")
 
-    # Latest 3-year band
+    # Latest 756-day band
     latest = results[0] if results else {}
     if latest.get("pe_high_3yr"):
-        print(f"\n  📈 Current 3-Year PE Band  "
+        print(f"\n  📈 Current 756-Day PE Band  "
               f"({latest.get('pe_band_days', 0)} trading days)")
         print(f"     PE High   : {latest['pe_high_3yr']:.2f}")
         print(f"     PE Median : {latest['pe_median_3yr']:.2f}")
@@ -646,7 +735,7 @@ def run_single(symbol: str, num_quarters: int):
     print(f"  YFinance      : {mapping['yf']}")
     print(f"  Fyers symbol  : {mapping['fyers']}")
     print(f"  Quarters      : {num_quarters}")
-    print(f"  PE Band       : {_PE_BAND_YEARS}-year lookback (daily PE)")
+    print(f"  PE Band       : {_PE_BAND_DAYS}-day lookback (daily PE)")
     print(f"{'=' * 60}\n")
 
     calc    = TrailingPECalculator()
@@ -660,8 +749,8 @@ def run_single(symbol: str, num_quarters: int):
 # ---------------------------------------------------------------------------
 def main():
     parser = argparse.ArgumentParser(
-        description="Trailing TTM PE Calculator with 3-Year PE Bands  "
-                    "(YFinance EPS + Fyers Prices)"
+        description="Trailing TTM PE Calculator with 756-Day PE Bands  "
+                    "(Consolidated EPS + Fyers Prices)"
     )
     parser.add_argument(
         "--symbol", type=str, default="RELIANCE",
